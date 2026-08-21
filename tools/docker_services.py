@@ -15,6 +15,9 @@ Labels (``hermes.service`` + ``hermes.description`` required; rest optional):
   hermes.description   markdown, shown in Portal's node detail card (REQUIRED)
   hermes.inputs        comma/space-separated ``scheme:value`` reads
   hermes.outputs       comma/space-separated ``scheme:value`` writes
+  hermes.hosts         comma/space-separated ``scheme:value`` stores this
+                       container RUNS (containment, not dataflow) — for a
+                       Postgres/Redis container, the tables/dbs it serves
   hermes.side_effects  comma/space-separated ``scheme:value`` terminal actions
 
 Example — a dashboard that reads a table a cron writes converges with that cron
@@ -25,6 +28,16 @@ on the shared ``postgres:analytics.events`` node:
     --label hermes.description="Renders analytics from the events table." \\
     --label hermes.inputs="postgres:analytics.events" \\
     my/dashboard
+
+Example — the Postgres container that HOSTS that table. It does not produce the
+rows (a cron does), so it declares `hosts`, not `outputs`, and meets the cron
+and the dashboard on the same node without claiming their provenance:
+
+  docker run -d \\
+    --label hermes.service="Analytics Postgres" \\
+    --label hermes.description="Postgres 16 store behind the analytics stack." \\
+    --label hermes.hosts="postgres:analytics.events" \\
+    postgres:16
 """
 import json
 import logging
@@ -73,6 +86,7 @@ def _parse_labels_to_declaration(
             inputs=_split_refs(labels.get("hermes.inputs")),
             outputs=_split_refs(labels.get("hermes.outputs")),
             side_effects=_split_refs(labels.get("hermes.side_effects")),
+            hosts=_split_refs(labels.get("hermes.hosts")),
         )
     except ValueError as exc:
         logger.warning(
@@ -90,6 +104,7 @@ def _parse_labels_to_declaration(
         "inputs": decl["inputs"],
         "outputs": decl["outputs"],
         "side_effects": decl["side_effects"],
+        "hosts": decl["hosts"],
     }
 
 

@@ -2546,6 +2546,7 @@ def terminal_tool(
     service_inputs: Optional[List[str]] = None,
     service_outputs: Optional[List[str]] = None,
     service_side_effects: Optional[List[str]] = None,
+    service_hosts: Optional[List[str]] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2564,6 +2565,7 @@ def terminal_tool(
         service_name: If set, registers this background process as a long-running SERVICE (a dashboard, an API, anything that outlives the turn) so it appears in the cron interflow dataflow graph. REQUIRES background=true. When you set this you MUST also set service_description. The tracked process is the lease — the service shows as live for exactly as long as it runs.
         service_description: REQUIRED whenever service_name is set. Markdown, human-readable — surfaced in the graph's node detail card so expanding the node answers "what is this and what does it do". A bare name is rejected.
         service_inputs/service_outputs/service_side_effects: The service's dataflow, as typed 'scheme:value' lists in the SAME vocabulary as a cron's inputs/outputs/side_effects (e.g. service_inputs=["postgres:analytics.events"] for a dashboard that reads that table). Inputs/outputs meet crons on shared resource nodes, so a dashboard reading a table a cron writes links up automatically.
+        service_hosts: Stores this service RUNS, as typed 'scheme:value' refs (wiki/file/postgres only — you can only host a data store). This is CONTAINMENT, not dataflow: use it when the service IS the store, e.g. service_hosts=["postgres:analytics.events"] for the Postgres container that serves that table. Do NOT use service_outputs for this — that would claim the service PRODUCES the rows, which is the writing cron's role, and the graph would show two indistinguishable producers. Rendered as a dashed edge with no arrowhead, since nothing flows along it.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -3031,6 +3033,7 @@ def terminal_tool(
                         inputs=service_inputs,
                         outputs=service_outputs,
                         side_effects=service_side_effects,
+                        hosts=service_hosts,
                     )
                 except ValueError as exc:
                     return json.dumps({
@@ -3059,14 +3062,20 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                # Register the service on the live session — it now surfaces in
-                # the cron interflow graph for as long as this process runs.
+                # Register the service on the live session BEFORE any checkpoint
+                # write can observe it. spawn_local/spawn_via_env call
+                # _write_checkpoint() themselves as their last step, so setting
+                # these fields after the spawn returned means the FIRST
+                # checkpoint records the session with an empty service_name —
+                # and if the gateway restarts before any later checkpoint write,
+                # the declaration is lost even though the process is adopted.
+                # register_service_declaration re-writes the checkpoint once the
+                # fields are attached, so the on-disk record always matches the
+                # live session.
                 if service_decl is not None:
-                    proc_session.service_name = service_decl["name"]
-                    proc_session.service_description = service_decl["description"]
-                    proc_session.service_inputs = service_decl["inputs"]
-                    proc_session.service_outputs = service_decl["outputs"]
-                    proc_session.service_side_effects = service_decl["side_effects"]
+                    process_registry.register_service_declaration(
+                        proc_session.id, service_decl
+                    )
 
                 result_data = {
                     "output": "Background process started",
@@ -3855,6 +3864,11 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "The service's terminal actions, as typed 'scheme:value' refs (telegram/slack/email/notify/pr/github/webhook). Sink leaves, not edges onward."
+            },
+            "service_hosts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Stores this service RUNS, as typed 'scheme:value' refs (wiki/file/postgres — you can only host a data store). CONTAINMENT, not dataflow: use it when the service IS the store, e.g. service_hosts=['postgres:analytics.events'] for the Postgres container serving that table. Do NOT put this in service_outputs — that claims the service PRODUCES the rows, which belongs to the cron that writes them, leaving two indistinguishable producers in the graph. Rendered as a dashed edge with no arrowhead."
             }
         },
         "required": ["command"]
@@ -3889,6 +3903,7 @@ def _handle_terminal(args, **kw):
         service_inputs=args.get("service_inputs"),
         service_outputs=args.get("service_outputs"),
         service_side_effects=args.get("service_side_effects"),
+        service_hosts=args.get("service_hosts"),
     )
 
 

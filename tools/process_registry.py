@@ -404,6 +404,9 @@ class ProcessSession:
     service_inputs: List[str] = field(default_factory=list)
     service_outputs: List[str] = field(default_factory=list)
     service_side_effects: List[str] = field(default_factory=list)
+    # Stores this service RUNS (containment, not dataflow). A Postgres container
+    # hosts the tables crons write; it does not produce their rows.
+    service_hosts: List[str] = field(default_factory=list)
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -2322,6 +2325,40 @@ class ProcessRegistry:
             result.append(entry)
         return result
 
+    def register_service_declaration(self, session_id: str, decl: dict) -> bool:
+        """Attach a validated service declaration to a live session, and persist it.
+
+        Split out of the caller so the attach and the checkpoint write are one
+        step. The spawn helpers write the checkpoint as their final action, so a
+        caller that mutates ``session.service_*`` afterwards leaves the on-disk
+        record showing an empty ``service_name`` until some later unrelated write
+        happens to refresh it. If the gateway restarts in that window the process
+        is adopted but its declaration is gone — the exact loss the checkpoint
+        fields were added to prevent. Persisting here closes that window.
+
+        ``decl`` is the output of ``cron.jobs.normalize_service_declaration``
+        (already validated). Returns False when the session is unknown or has
+        already exited, so a caller never silently believes a dead session was
+        registered.
+        """
+        with self._lock:
+            session = self._running.get(session_id)
+        if session is None or session.exited:
+            logger.warning(
+                "register_service_declaration: session %s is not running; "
+                "service %r not registered",
+                session_id, decl.get("name"),
+            )
+            return False
+        session.service_name = decl["name"]
+        session.service_description = decl["description"]
+        session.service_inputs = list(decl["inputs"])
+        session.service_outputs = list(decl["outputs"])
+        session.service_side_effects = list(decl["side_effects"])
+        session.service_hosts = list(decl.get("hosts") or [])
+        self._write_checkpoint()
+        return True
+
     def collect_service_declarations(self) -> list:
         """Live long-running SERVICES for the cron interflow graph.
 
@@ -2355,6 +2392,7 @@ class ProcessRegistry:
                 "inputs": list(s.service_inputs),
                 "outputs": list(s.service_outputs),
                 "side_effects": list(s.service_side_effects),
+                "hosts": list(s.service_hosts),
             })
         return services
 
@@ -2578,6 +2616,7 @@ class ProcessRegistry:
                             "service_inputs": s.service_inputs,
                             "service_outputs": s.service_outputs,
                             "service_side_effects": s.service_side_effects,
+                            "service_hosts": s.service_hosts,
                         })
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
@@ -2683,6 +2722,7 @@ class ProcessRegistry:
                 service_inputs=entry.get("service_inputs") or [],
                 service_outputs=entry.get("service_outputs") or [],
                 service_side_effects=entry.get("service_side_effects") or [],
+                service_hosts=entry.get("service_hosts") or [],
             )
             with self._lock:
                 self._running[session.id] = session

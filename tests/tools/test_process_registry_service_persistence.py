@@ -208,3 +208,50 @@ class TestBackwardCompatibility:
                 assert revived.service_inputs == []
                 # Not a service, so it contributes no graph node.
                 assert fresh.collect_service_declarations() == []
+
+
+class TestRegistrationPersistsImmediately:
+    """The spawn helpers write the checkpoint as their LAST action, so attaching
+    the declaration afterwards leaves an empty service_name on disk until some
+    unrelated later write refreshes it. A gateway restart in that window adopts
+    the process without its identity — the exact loss the service_* fields exist
+    to prevent. register_service_declaration must close that window."""
+
+    def test_registration_is_visible_on_disk_immediately(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        s = _service_session(sid="proc_dash2", pid=7777)
+        # Arrive as a bare session, exactly as a spawn helper leaves it.
+        for f in ("service_name", "service_description"):
+            setattr(s, f, "")
+        s.service_inputs, s.service_outputs, s.service_side_effects = [], [], []
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._running[s.id] = s
+            registry._write_checkpoint()          # the spawn helper's write
+            assert json.loads(checkpoint.read_text())[0]["service_name"] == ""
+
+            assert registry.register_service_declaration(s.id, {
+                "name": "Compendium Dashboard",
+                "description": "FastAPI dashboard on :8700.",
+                "inputs": ["postgres:agentic_payments.transfers"],
+                "outputs": [],
+                "side_effects": [],
+            }) is True
+
+            # Persisted WITHOUT waiting for any further checkpoint write.
+            entry = json.loads(checkpoint.read_text())[0]
+            assert entry["service_name"] == "Compendium Dashboard"
+            assert entry["service_inputs"] == ["postgres:agentic_payments.transfers"]
+
+    def test_registering_an_unknown_or_dead_session_reports_failure(self, registry, tmp_path):
+        """A caller must not believe a dead session was registered."""
+        checkpoint = tmp_path / "procs.json"
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            decl = {"name": "X", "description": "d", "inputs": [],
+                    "outputs": [], "side_effects": []}
+            assert registry.register_service_declaration("proc_nope", decl) is False
+
+            dead = _service_session(sid="proc_dead", pid=8888)
+            dead.exited = True
+            registry._running[dead.id] = dead
+            assert registry.register_service_declaration("proc_dead", decl) is False

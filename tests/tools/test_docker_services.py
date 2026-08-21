@@ -45,14 +45,15 @@ class TestParseLabels:
             "hermes.description": "# Dash\nRenders analytics.",
             "hermes.inputs": "postgres:analytics.events",
         })
-        assert decl == {
-            "id": "docker:abcdef012345",  # truncated to 12
-            "label": "Analytics Dashboard",
-            "description": "# Dash\nRenders analytics.",
-            "inputs": ["postgres:analytics.events"],
-            "outputs": [],
-            "side_effects": [],
-        }
+        # Assert the label→declaration CONTRACT, not the exact key set: an
+        # exact-dict compare is a change-detector test (AGENTS.md) that breaks on
+        # every new optional field — which is what happened when `hosts` landed.
+        assert decl["id"] == "docker:abcdef012345"  # truncated to 12
+        assert decl["label"] == "Analytics Dashboard"
+        assert decl["description"] == "# Dash\nRenders analytics."
+        assert decl["inputs"] == ["postgres:analytics.events"]
+        for empty in ("outputs", "side_effects", "hosts"):
+            assert decl[empty] == []
 
     def test_no_service_label_is_not_a_hermes_service(self):
         from tools.docker_services import _parse_labels_to_declaration

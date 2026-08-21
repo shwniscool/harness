@@ -546,13 +546,15 @@ class TestServiceDeclaration:
             description="  Renders analytics.  ",
             inputs=["postgres:analytics.events", "postgres:analytics.events"],
         )
-        assert decl == {
-            "name": "Analytics Dashboard",
-            "description": "Renders analytics.",
-            "inputs": ["postgres:analytics.events"],
-            "outputs": [],
-            "side_effects": [],
-        }
+        # Assert the normalization CONTRACT (trim, dedupe, empty defaults) rather
+        # than freezing the exact key set — an exact-dict compare here is a
+        # change-detector test (see AGENTS.md) and breaks on every new optional
+        # field, which is what happened when `hosts` was added.
+        assert decl["name"] == "Analytics Dashboard"
+        assert decl["description"] == "Renders analytics."
+        assert decl["inputs"] == ["postgres:analytics.events"]
+        for empty in ("outputs", "side_effects", "hosts"):
+            assert decl[empty] == []
 
     def test_description_required(self):
         from cron.jobs import normalize_service_declaration
@@ -604,3 +606,91 @@ class TestCronGraphRPC:
         assert captured["rid"] == 7
         assert set(captured["result"].keys()) == {"nodes", "edges"}
         assert any(n["kind"] == "cron" for n in captured["result"]["nodes"])
+
+
+class TestHostsContainmentEdge:
+    """`hosts` says a service RUNS a store. It is containment, not dataflow: the
+    Postgres container does not produce the rows its tables hold — the indexer
+    cron does. Declaring the tables as `outputs` (the only option before this)
+    drew a `writes` edge indistinguishable from the cron's, collapsing the
+    runtime/data distinction."""
+
+    def _pg_service(self, hosts):
+        from cron.jobs import normalize_service_declaration
+
+        decl = normalize_service_declaration(
+            name="Compendium Postgres",
+            description="Postgres 16 store for agentic-payments.",
+            hosts=hosts,
+        )
+        return {"id": "docker:a1ce2ec76fb9", "label": decl["name"],
+                "description": decl["description"], "inputs": decl["inputs"],
+                "outputs": decl["outputs"], "side_effects": decl["side_effects"],
+                "hosts": decl["hosts"]}
+
+    def test_hosts_emits_a_hosts_edge_not_a_writes_edge(self):
+        ref = "postgres:agentic_payments.transfers"
+        from cron.jobs import build_cron_graph
+
+        jobs = [{"id": "indexer", "name": "indexer", "outputs": [ref]}]
+        g = build_cron_graph(jobs=jobs, services=[self._pg_service([ref])])
+
+        typed = {(e["source"], e["target"], e["type"]) for e in g["edges"]}
+        # The cron is the sole producer.
+        assert ("indexer", ref, "writes") in typed
+        # The container states containment, and never claims to write.
+        assert ("docker:a1ce2ec76fb9", ref, "hosts") in typed
+        assert ("docker:a1ce2ec76fb9", ref, "writes") not in typed
+
+    def test_hosted_ref_dedupes_onto_the_cron_node(self):
+        """Containment must meet dataflow on ONE node, or the graph shows the
+        store twice and the whole point is lost."""
+        ref = "postgres:agentic_payments.transfers"
+        from cron.jobs import build_cron_graph
+
+        jobs = [{"id": "indexer", "name": "indexer", "outputs": [ref]},
+                {"id": "reader", "name": "reader", "inputs": [ref]}]
+        g = build_cron_graph(jobs=jobs, services=[self._pg_service([ref])])
+        assert sum(1 for n in g["nodes"] if n["id"] == ref) == 1
+
+    def test_hosting_alone_does_not_make_a_ref_an_artifact(self):
+        """Hosting is not producing. A table only a container hosts has no
+        provenance, so it must stay a `source` — otherwise the graph asserts the
+        container produced data it merely stores."""
+        from cron.jobs import build_cron_graph
+
+        ref = "postgres:agentic_payments.seller_meta"
+        g = build_cron_graph(jobs=[], services=[self._pg_service([ref])])
+        node = next(n for n in g["nodes"] if n["id"] == ref)
+        assert node["kind"] == "source"
+
+    def test_a_real_writer_still_promotes_a_hosted_ref_to_artifact(self):
+        """Order independence: whichever is declared first, a ref with a real
+        cron writer is an artifact."""
+        from cron.jobs import build_cron_graph
+
+        ref = "postgres:agentic_payments.transfers"
+        jobs = [{"id": "indexer", "name": "indexer", "outputs": [ref]}]
+        g = build_cron_graph(jobs=jobs, services=[self._pg_service([ref])])
+        node = next(n for n in g["nodes"] if n["id"] == ref)
+        assert node["kind"] == "artifact"
+
+    def test_hosts_rejects_non_store_schemes(self):
+        """You can host a data store, not a URL or a telegram chat."""
+        from cron.jobs import normalize_service_declaration
+
+        for bad in ["https:example.com/x", "telegram:me", "cron-output:abc123"]:
+            with pytest.raises(ValueError):
+                normalize_service_declaration(
+                    name="X", description="d", hosts=[bad])
+
+    def test_hosts_defaults_empty_and_is_backward_compatible(self):
+        """A service declared without `hosts` behaves exactly as before."""
+        from cron.jobs import build_cron_graph, normalize_service_declaration
+
+        decl = normalize_service_declaration(name="X", description="d")
+        assert decl["hosts"] == []
+        svc = {"id": "proc_1", "label": "X", "description": "d",
+               "inputs": [], "outputs": [], "side_effects": []}   # no 'hosts' key
+        g = build_cron_graph(jobs=[], services=[svc])
+        assert [e for e in g["edges"] if e["type"] == "hosts"] == []

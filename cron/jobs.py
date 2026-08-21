@@ -1828,6 +1828,7 @@ def normalize_service_declaration(
     inputs: Any = None,
     outputs: Any = None,
     side_effects: Any = None,
+    hosts: Any = None,
 ) -> Dict[str, Any]:
     """Validate & normalize a long-running service's dataflow declaration.
 
@@ -1861,6 +1862,19 @@ def normalize_service_declaration(
             side_effects,
             allowed_schemes=_SIDE_EFFECT_SCHEMES,
             field_name="service side_effects",
+        ),
+        # `hosts` is CONTAINMENT, not dataflow: this service RUNS the named
+        # resources. A Postgres container hosting postgres:app.events had no way
+        # to say so — declaring the tables as `outputs` drew a `writes` edge,
+        # making the container claim to PRODUCE the rows, indistinguishable from
+        # the indexer cron that actually does. That collapsed the runtime/data
+        # distinction, so the graph could not answer "what runs this store".
+        #
+        # Validated against _OUTPUT_SCHEMES rather than a new vocabulary: you can
+        # only host a DATA STORE (wiki/file/postgres). Hosting a url or a
+        # cron-output is meaningless, and hosting a telegram sink even more so.
+        "hosts": _normalize_resource_list(
+            hosts, allowed_schemes=_OUTPUT_SCHEMES, field_name="service hosts"
         ),
     }
 
@@ -2004,6 +2018,19 @@ def build_cron_graph(
         for ref in service.get("side_effects") or []:
             _ensure_resource(ref, "sink")
             edges.append({"source": sid, "target": ref, "type": ref.split(":", 1)[0]})
+        # Containment edges. Deliberately NOT "artifact": hosting a store is not
+        # producing its contents, so a table that only a container hosts must
+        # stay a `source` until some cron actually writes it — otherwise the
+        # graph would claim provenance the container does not have. _ensure_resource
+        # already promotes source→artifact when a real writer shows up, so
+        # declaration order does not matter.
+        #
+        # The edge points service→resource (the runtime contains the data), and
+        # Portal renders `hosts` dashed with no arrowhead since nothing travels
+        # along it.
+        for ref in service.get("hosts") or []:
+            _ensure_resource(ref, "source")
+            edges.append({"source": sid, "target": ref, "type": "hosts"})
 
     for ref in sorted(resource_kind):
         scheme, _, value = ref.partition(":")
