@@ -3059,14 +3059,20 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                # Register the service on the live session — it now surfaces in
-                # the cron interflow graph for as long as this process runs.
+                # Register the service on the live session BEFORE any checkpoint
+                # write can observe it. spawn_local/spawn_via_env call
+                # _write_checkpoint() themselves as their last step, so setting
+                # these fields after the spawn returned means the FIRST
+                # checkpoint records the session with an empty service_name —
+                # and if the gateway restarts before any later checkpoint write,
+                # the declaration is lost even though the process is adopted.
+                # register_service_declaration re-writes the checkpoint once the
+                # fields are attached, so the on-disk record always matches the
+                # live session.
                 if service_decl is not None:
-                    proc_session.service_name = service_decl["name"]
-                    proc_session.service_description = service_decl["description"]
-                    proc_session.service_inputs = service_decl["inputs"]
-                    proc_session.service_outputs = service_decl["outputs"]
-                    proc_session.service_side_effects = service_decl["side_effects"]
+                    process_registry.register_service_declaration(
+                        proc_session.id, service_decl
+                    )
 
                 result_data = {
                     "output": "Background process started",

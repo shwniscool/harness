@@ -2322,6 +2322,39 @@ class ProcessRegistry:
             result.append(entry)
         return result
 
+    def register_service_declaration(self, session_id: str, decl: dict) -> bool:
+        """Attach a validated service declaration to a live session, and persist it.
+
+        Split out of the caller so the attach and the checkpoint write are one
+        step. The spawn helpers write the checkpoint as their final action, so a
+        caller that mutates ``session.service_*`` afterwards leaves the on-disk
+        record showing an empty ``service_name`` until some later unrelated write
+        happens to refresh it. If the gateway restarts in that window the process
+        is adopted but its declaration is gone — the exact loss the checkpoint
+        fields were added to prevent. Persisting here closes that window.
+
+        ``decl`` is the output of ``cron.jobs.normalize_service_declaration``
+        (already validated). Returns False when the session is unknown or has
+        already exited, so a caller never silently believes a dead session was
+        registered.
+        """
+        with self._lock:
+            session = self._running.get(session_id)
+        if session is None or session.exited:
+            logger.warning(
+                "register_service_declaration: session %s is not running; "
+                "service %r not registered",
+                session_id, decl.get("name"),
+            )
+            return False
+        session.service_name = decl["name"]
+        session.service_description = decl["description"]
+        session.service_inputs = list(decl["inputs"])
+        session.service_outputs = list(decl["outputs"])
+        session.service_side_effects = list(decl["side_effects"])
+        self._write_checkpoint()
+        return True
+
     def collect_service_declarations(self) -> list:
         """Live long-running SERVICES for the cron interflow graph.
 
